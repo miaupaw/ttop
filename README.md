@@ -4,24 +4,9 @@ A live thermal monitor and bench for Intel CPUs, in pure bash.
 No Python, no daemons, no dependencies beyond coreutils and awk — runs anywhere a shell does,
 including a headless router over ssh.
 
-```
-  ◢◤ GATE · THERMAL SANDWICH ◥◣   N100 · copper · shim · AXP90
+![ttop on a 24-core laptop: per-core temps, real throttling events, sparkline](docs/screenshot.png)
 
-  phase   ▶ LOAD       left   8:18   elapsed 2:42   q — quit
-
-  PACKAGE    41°C     ▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱  TjMax 105°C
-
-  core 0     40°C     ▰▰▰▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱
-  core 1     41°C     ▰▰▰▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱
-
-  POWER       11.4 W  ▰▰▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱  PL1 30 · PL2 33 W
-  CLOCK     2899 MHz  avg of 4 cores
-  DIMM       31°C     spd5118 on module
-  THROTTLE  ✓ none
-
-  package, last 64 s · scale 28…42°C
-   28° ▁▁▂▄▆▇▇█▇█▇█▇▇█▇██▇▇█▇██▇▇ 42°
-```
+*A 24-core laptop caught red-handed: a 96 °C spike and real throttling events, right in the "idle" phase.*
 
 ## Modes
 
