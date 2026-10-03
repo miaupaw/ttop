@@ -1,0 +1,251 @@
+#!/usr/bin/env bash
+####################################################################################################
+# ttop — thermal top: a live CPU thermal monitor and bench in pure bash
+#
+# Two modes:
+#   bench  — phases IDLE (baseline) → LOAD (stress-ng on all cores) → COOLDOWN (heat release curve)
+#   watch  — no phases, no load: live readings, sparkline and peak until you press q
+#
+# Honest sources only: coretemp (the digital sensor inside the die — the same one the CPU uses
+# to decide when to throttle), RAPL (package watts from the energy counter), thermal_throttle
+# counters, spd5118 (DDR5 module temperature, when present). CSV — so a curve can be analysed
+# later instead of remembered: always in bench, with --log in watch.
+#
+# Works without root: energy_uj is 0400 since CVE-2020-8694 (PLATYPUS), so watts show "—",
+# while temperatures, clocks and throttling are readable anyway. Checking a temperature
+# should not require sudo.
+#
+#   ttop                      bench 60/600/180 s (same as `ttop bench`)
+#   ttop bench 30 300 120     custom phase durations; plain `ttop 30 300 120` works too
+#   ttop watch [--log]        monitor
+# Quit with q or Ctrl+C. The load is stopped on any exit (trap).
+#
+# Born on 2026-10-03 as a test rig for a homemade copper shim between an Intel N100 and its
+# heatsink, on a NixOS router called gate.
+####################################################################################################
+set -uo pipefail
+
+usage() {
+    cat <<'EOF'
+ttop — thermal top: live CPU thermal monitor & bench (coretemp · RAPL · throttle)
+
+  ttop [bench] [idle_s] [load_s] [cool_s]   bench: IDLE → LOAD (stress-ng) → COOLDOWN
+                                            defaults 60 600 180, CSV log always
+  ttop watch [--log]                        live monitor, no load; CSV only with --log
+  ttop -h | --help                          this help
+
+Power (RAPL) needs root: run with sudo, or watch the rest without it.
+Keys: q — quit (Ctrl+C works too).
+EOF
+}
+
+# --- Arguments: mode, phase durations (bench only), --log/--no-log ---
+MODE=bench; LOGCSV=""
+case "${1:-}" in
+    -h|--help)              usage; exit 0 ;;
+    watch|monitor|-w)       MODE=watch; shift ;;
+    bench)                  shift ;;
+    ''|[0-9]*|--log|--no-log) ;;                       # plain call: durations right away
+    *)                      usage; exit 1 ;;
+esac
+NUMS=()
+for a in "$@"; do
+    case "$a" in
+        --log)    LOGCSV=1 ;;
+        --no-log) LOGCSV=0 ;;
+        *[!0-9]*|'') echo "unknown argument: $a"; usage; exit 1 ;;
+        *)        NUMS+=("$a") ;;
+    esac
+done
+[ "$MODE" = watch ] && ((${#NUMS[@]})) && { echo "watch takes no durations"; exit 1; }
+IDLE=${NUMS[0]:-60}; LOAD=${NUMS[1]:-600}; COOL=${NUMS[2]:-180}
+[ -z "$LOGCSV" ] && { [ "$MODE" = bench ] && LOGCSV=1 || LOGCSV=0; }
+TJMAX=105
+CSV="${CSV:-$HOME/ttop-$MODE-$(date +%Y%m%d-%H%M%S).csv}"
+
+# --- Palette ---
+E=$'\e'; R="$E[0m"; B="$E[1m"; D="$E[2m"
+CYAN="$E[38;5;51m"; GRN="$E[38;5;83m"; YEL="$E[38;5;220m"; ORG="$E[38;5;208m"; RED="$E[38;5;196m"
+MAG="$E[38;5;207m"; GRY="$E[38;5;244m"; WHT="$E[38;5;255m"
+
+# --- Where things live ---
+hw_by_name() { for h in /sys/class/hwmon/hwmon*; do [ "$(cat "$h/name")" = "$1" ] && { echo "$h"; return; }; done; }
+CT=$(hw_by_name coretemp); SPD=$(hw_by_name spd5118)
+[ -n "$CT" ] || { echo "coretemp not found"; exit 1; }
+PKG_IN=""; CORES=()
+for t in "$CT"/temp*_input; do
+    case "$(cat "${t%_input}_label")" in
+        Package*) PKG_IN=$t ;;
+        Core*)    CORES+=("$t") ;;
+    esac
+done
+RAPL=/sys/class/powercap/intel-rapl:0
+# Limits are world-readable, the energy counter is root-only. Without it watts show "—".
+PL1=$(( $(cat $RAPL/constraint_0_power_limit_uw 2>/dev/null || echo 0) / 1000000 ))
+PL2=$(( $(cat $RAPL/constraint_1_power_limit_uw 2>/dev/null || echo 0) / 1000000 ))
+if cat $RAPL/energy_uj >/dev/null 2>&1; then
+    HAVE_RAPL=1; RAPL_MAX=$(cat $RAPL/max_energy_range_uj)
+else
+    HAVE_RAPL=0; RAPL_MAX=0
+fi
+((PL2 > 0)) || PL2=30                                   # some scale for the power bar without limits
+NCPU=$(nproc)
+# Header subtitle: the CPU model without marketing noise, e.g. "N100" or "i9-13950HX"
+CPU=$(awk -F': ' '/^model name/{print $2; exit}' /proc/cpuinfo \
+      | sed -E 's/\((R|TM)\)//g; s/ @ .*//; s/[0-9]+th Gen //; s/Intel //; s/Core //; s/ CPU//; s/  +/ /g; s/^ //')
+
+# --- stress-ng — bench only: from PATH or from nixpkgs (before the screen starts) ---
+STRESS=""
+if [ "$MODE" = bench ]; then
+    STRESS=$(command -v stress-ng || true)
+    if [ -z "$STRESS" ]; then
+        echo "stress-ng: fetching from nixpkgs..."
+        STRESS="$(nix build --no-link --print-out-paths nixpkgs#stress-ng 2>/dev/null)/bin/stress-ng"
+        [ -x "$STRESS" ] || { echo "could not get stress-ng"; exit 1; }
+    fi
+fi
+
+throttle_sum() { cat /sys/devices/system/cpu/cpu*/thermal_throttle/{core,package}_throttle_count 2>/dev/null | awk '{s+=$1} END{print s+0}'; }
+avg_mhz() { cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq | awk '{s+=$1;n++} END{printf "%d", s/n/1000}'; }
+
+# --- Cleanup on any exit ---
+SPID=""
+cleanup() { [ -n "$SPID" ] && kill "$SPID" 2>/dev/null; wait 2>/dev/null; printf '%s[?25h%s[0m\n' "$E" "$E"; stty echo 2>/dev/null; }
+# INT/TERM mean EXIT, cleanup hangs on EXIT. An early version put cleanup straight on INT:
+# the load stopped, the cursor came back — and the loop kept spinning; Ctrl+C "did nothing".
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+printf '%s[?25l%s[2J' "$E" "$E"; stty -echo 2>/dev/null
+
+# --- Drawing ---
+lbl() { printf '%s%-10s%s' "$GRY" "$1" "$R"; }   # label: ASCII, so %-10s is honest in any locale
+tcol() { local t=$1; ((t<50)) && { echo "$CYAN"; return; }; ((t<65)) && { echo "$GRN"; return; }; ((t<80)) && { echo "$YEL"; return; }; ((t<95)) && { echo "$ORG"; return; }; echo "$RED"; }
+bar() { # value, max, width, colour
+    # Not `tr ' ' '█'`: tr works on BYTES, and block glyphs are three bytes in UTF-8 — tr put in
+    # the first byte and drew a broken glyph. Bash substitution ${s// /▰} inserts the whole
+    # string in any locale, under sudo too.
+    # ▰▱ (U+25B0/U+25B1) picked from a dozen candidates: they look like 80s Japanese hardware.
+    # Segments read as an instrument scale rather than a fill.
+    local v=$1 max=$2 w=$3 c=$4 n full empty; n=$(( v*w/max )); ((n>w)) && n=$w; ((n<0)) && n=0
+    printf -v full '%*s' "$n" '';        full=${full// /▰}
+    printf -v empty '%*s' $((w-n)) '';   empty=${empty// /▱}
+    printf '%s%s%s%s%s' "$c" "$full" "$D$GRY" "$empty" "$R"
+}
+SPARK=(▁ ▂ ▃ ▄ ▅ ▆ ▇ █); HIST=(); HIST_T=(); HW=64
+# The scale is LIVE: the span of what is in the window, not 20..TjMax. A fixed 20..105 °C put
+# a real 28–43 range into the two lowest cells and the graph became a flat line. Minimum span
+# is 8 °C so ±1 °C sensor noise does not turn into mountains. Colour follows the ABSOLUTE
+# temperature, as everywhere else.
+# The result goes to globals SP/SLO/SHI rather than stdout: calling $(spark) would run in a
+# subshell and the scale bounds would never come back (the labels would show zeros).
+SPAN_MIN=8; SLO=0; SHI=0; SP=""
+spark() {
+    local t i lo=999 hi=-999 mid
+    for t in "${HIST[@]}"; do ((t<lo)) && lo=$t; ((t>hi)) && hi=$t; done
+    if (( hi - lo < SPAN_MIN )); then mid=$(( (hi + lo) / 2 )); lo=$(( mid - SPAN_MIN/2 )); hi=$(( lo + SPAN_MIN )); fi
+    SLO=$lo; SHI=$hi; SP=""
+    for t in "${HIST[@]}"; do i=$(( (t-lo)*7/(hi-lo) )); ((i<0)) && i=0; ((i>7)) && i=7; SP+="$(tcol "$t")${SPARK[$i]}"; done
+    SP+="$R"
+}
+
+# --- State ---
+((LOGCSV)) && echo "t,phase,pkg_c,$(for i in "${!CORES[@]}"; do printf 'core%d_c,' "$i"; done)pkg_w,avg_mhz,dimm_c,throttle" > "$CSV"
+T0=$(date +%s); TH0=$(throttle_sum); PEAK=0; PEAKW=0
+declare -A SUM CNT
+PHASE=""; PREV_T=$(date +%s%N)
+((HAVE_RAPL)) && PREV_E=$(cat $RAPL/energy_uj) || PREV_E=0
+[ "$MODE" = watch ] && PHASES=(WATCH) || PHASES=(IDLE LOAD COOLDOWN)
+
+while :; do
+    now=$(date +%s); el=$(( now - T0 )); left=0
+    if [ "$MODE" = watch ];            then NP="WATCH"
+    elif (( el < IDLE ));              then NP="IDLE";     left=$(( IDLE - el ))
+    elif (( el < IDLE+LOAD ));         then NP="LOAD";     left=$(( IDLE+LOAD - el ))
+    elif (( el < IDLE+LOAD+COOL ));    then NP="COOLDOWN"; left=$(( IDLE+LOAD+COOL - el ))
+    else break; fi
+
+    if [ "$NP" != "$PHASE" ]; then
+        case "$NP" in
+            LOAD)     "$STRESS" --cpu "$NCPU" --cpu-method matrixprod --timeout "${LOAD}s" >/dev/null 2>&1 & SPID=$! ;;
+            COOLDOWN) [ -n "$SPID" ] && kill "$SPID" 2>/dev/null; SPID="" ;;
+        esac
+        PHASE=$NP
+    fi
+
+    # --- sample ---
+    pkg=$(( $(cat "$PKG_IN") / 1000 )); ct=(); for c in "${CORES[@]}"; do ct+=( $(( $(cat "$c")/1000 )) ); done
+    tn=$(date +%s%N); w10=0
+    if ((HAVE_RAPL)); then
+        e=$(cat $RAPL/energy_uj)
+        de=$(( e - PREV_E )); ((de<0)) && de=$(( de + RAPL_MAX ))
+        w10=$(( de * 10 / ((tn - PREV_T) / 1000) ))      # watts ×10, no floats
+        PREV_E=$e
+    fi
+    PREV_T=$tn
+    mhz=$(avg_mhz); dimm=$( [ -n "$SPD" ] && echo $(( $(cat "$SPD/temp1_input")/1000 )) || echo 0 )
+    th=$(( $(throttle_sum) - TH0 ))
+    ((pkg>PEAK)) && PEAK=$pkg; ((w10>PEAKW)) && PEAKW=$w10
+    SUM[$PHASE]=$(( ${SUM[$PHASE]:-0} + pkg )); CNT[$PHASE]=$(( ${CNT[$PHASE]:-0} + 1 ))
+    HIST+=("$pkg"); HIST_T+=("$el")
+    ((${#HIST[@]}>HW)) && { HIST=("${HIST[@]:1}"); HIST_T=("${HIST_T[@]:1}"); }
+    ((LOGCSV)) && echo "$el,$PHASE,$pkg,$(IFS=,; echo "${ct[*]}"),$( ((HAVE_RAPL)) && echo "$((w10/10)).$((w10%10))" ),$mhz,$dimm,$th" >> "$CSV"
+
+    # --- screen ---
+    case "$PHASE" in IDLE|WATCH) pc=$CYAN ;; LOAD) pc=$RED ;; *) pc=$MAG ;; esac
+    tc=$(tcol "$pkg")
+    {
+    printf '%s[H' "$E"
+    printf '  %s%s◢◤ TTOP · THERMAL TOP ◥◣%s   %s%s · %d threads%s%s[K\n\n' "$B" "$CYAN" "$R" "$GRY" "$CPU" "$NCPU" "$R" "$E"
+    if [ "$MODE" = watch ]; then
+        printf '  mode   %s%s ▶ MONITOR %s          elapsed %d:%02d   %sq — quit%s%s[K\n\n' \
+            "$B" "$pc" "$R" $((el/60)) $((el%60)) "$D$GRY" "$R" "$E"
+    else
+        printf '  phase  %s%s ▶ %-9s%s  left %s%3d:%02d%s   elapsed %d:%02d   %sq — quit%s%s[K\n\n' \
+            "$B" "$pc" "$PHASE" "$R" "$WHT" $((left/60)) $((left%60)) "$R" $((el/60)) $((el%60)) "$D$GRY" "$R" "$E"
+    fi
+    # Grid: label — 10 columns (lbl), value — exactly 8 visible characters, then 2 spaces and
+    # the bar. The value width is held by the format itself, not by %-Ns: "°" is two bytes in
+    # UTF-8, and under sudo with the C locale printf would count bytes — the column would
+    # drift. An earlier version aligned with spaces by eye: core 10+ shifted by one character
+    # and POWER started its bar elsewhere (visible on 24 cores, invisible on 4).
+    #   temperature  '%3d°C   '  → 5 + 3 = 8
+    #   power        '%4d.%d W'  → 8
+    #   clock        '%4d MHz'   → 8
+    printf '  '; lbl PACKAGE; printf '%s%s%3d°C   %s  ' "$B" "$tc" "$pkg" "$R"; bar "$pkg" $TJMAX 40 "$tc"; printf '  %sTjMax %d°C%s%s[K\n\n' "$GRY" $TJMAX "$R" "$E"
+    for i in "${!ct[@]}"; do
+        printf '  '; lbl "core $i"; printf '%s%3d°C   %s  ' "$(tcol "${ct[$i]}")" "${ct[$i]}" "$R"; bar "${ct[$i]}" $TJMAX 30 "$(tcol "${ct[$i]}")"; printf '%s[K\n' "$E"
+    done
+    printf '\n  '; lbl POWER
+    if ((HAVE_RAPL)); then
+        printf '%s%4d.%d W%s  ' "$B$YEL" $((w10/10)) $((w10%10)) "$R"; bar $((w10/10)) "$PL2" 30 "$YEL"
+        printf '  %sPL1 %d · PL2 %d W%s%s[K\n' "$GRY" "$PL1" "$PL2" "$R" "$E"
+    else
+        printf '%s       —%s  %sRAPL needs root: sudo for watts%s%s[K\n' "$GRY" "$R" "$D$GRY" "$R" "$E"
+    fi
+    printf '  '; lbl CLOCK;    printf '%s%4d MHz%s  %savg of %d cores%s%s[K\n' "$WHT" "$mhz" "$R" "$GRY" "$NCPU" "$R" "$E"
+    printf '  '; lbl DIMM;     printf '%s%3d°C   %s  %sspd5118 on module%s%s[K\n' "$(tcol "$dimm")" "$dimm" "$R" "$GRY" "$R" "$E"
+    printf '  '; lbl THROTTLE
+    if ((th==0)); then printf '%s✓ none%s%s[K\n\n' "$GRN" "$R" "$E"
+    else printf '%s✗ %d events since start%s%s[K\n\n' "$B$RED" "$th" "$R" "$E"; fi
+    # the graph window comes from real timestamps: sampling is not exactly once per second
+    spark; win=$(( ${HIST_T[-1]} - ${HIST_T[0]} ))
+    printf '  %spackage, last %d s · scale %s%d…%d°C%s%s[K\n' "$GRY" "$win" "$WHT" "$SLO" "$SHI" "$R" "$E"
+    printf '  %s%3d°%s %s %s%d°%s%s[K\n\n' "$GRY" "$SLO" "$R" "$SP" "$GRY" "$SHI" "$R" "$E"
+    printf '  %speak%s %s%d°C%s' "$GRY" "$R" "$(tcol $PEAK)" "$PEAK" "$R"
+    ((HAVE_RAPL)) && printf ' · %s%d.%d W%s' "$YEL" $((PEAKW/10)) $((PEAKW%10)) "$R"
+    for p in "${PHASES[@]}"; do
+        [ -n "${CNT[$p]:-}" ] && printf '   %s%s avg%s %d°C' "$GRY" "$( [ "$p" = WATCH ] && echo session || echo "${p,,}" )" "$R" $(( SUM[$p] / CNT[$p] ))
+    done
+    if ((LOGCSV)); then printf '%s[K\n\n  %slog: %s%s%s[J' "$E" "$D$GRY" "$CSV" "$R" "$E"
+    else printf '%s[K\n\n  %slog: off (--log to record)%s%s[J' "$E" "$D$GRY" "$R" "$E"; fi
+    } 2>/dev/null
+
+    read -rsn1 -t 1 k && [ "$k" = q ] && break
+done
+
+cleanup; trap - EXIT
+printf '\n  %sDone.%s peak %s%d°C%s' "$B$GRN" "$R" "$(tcol $PEAK)" "$PEAK" "$R"
+((HAVE_RAPL)) && printf ', power up to %d.%d W' $((PEAKW/10)) $((PEAKW%10))
+printf ', throttle events: %d.' "$(( $(throttle_sum) - TH0 ))"
+((LOGCSV)) && printf ' CSV: %s' "$CSV"
+printf '\n'
